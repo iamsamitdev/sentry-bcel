@@ -17,7 +17,7 @@
 | 2.1 | Issue Grouping และ Fingerprint | 40 นาที | ยุบ 5 Issue ให้เหลือ 1 |
 | 2.2 | เติมบริบท (User, Tag, Breadcrumb) | 40 นาที | รู้ว่าใครได้รับผลกระทบ |
 | **2.3** | **เปิด Performance + sentry-jdbc** | **50 นาที** | **เห็นทุก Query เป็น Span** |
-| **2.4** | **ล่า N+1 และ Slow Query** | **60 นาที** | **หาต้นเหตุได้จาก Sentry** |
+| **2.4** | **ล่า N+1 และ Slow Query**<br><sub>(รวมบรรยาย "N+1 Query คืออะไร" 10 นาที)</sub> | **70 นาที** | **หาต้นเหตุได้จาก Sentry** |
 | **2.5** | **ฝัง @sentry/angular** | **50 นาที** | **Error ฝั่งหน้าเว็บเข้า Sentry** |
 | **2.6** | **Distributed Tracing End-to-End** | **50 นาที** | **1 Trace เห็นครบ 3 ชั้น** |
 
@@ -239,6 +239,124 @@ WHERE tx_date >= %s AND tx_date < %s GROUP BY branch_code ORDER BY totalAmount D
 
 > Workshop หลักของช่วงเช้า-บ่ายวันที่ 2 · 60 นาที
 
+---
+
+### 📖 ทำความเข้าใจก่อน: N+1 Query คืออะไร
+
+> วิทยากรบรรยายส่วนนี้ก่อนลงมือ ใช้เวลา 10 นาที
+> ผู้เรียนหลายคนเคยได้ยินคำนี้แต่ยังนึกภาพไม่ออกว่ามันหน้าตาเป็นอย่างไรในระบบจริง
+
+#### นิยาม
+
+**N+1 Query** คือปัญหาด้านประสิทธิภาพที่เกิดขึ้นเมื่อ
+
+> ระบบดึงข้อมูล**หลัก** 1 ครั้ง (**1** query) แล้ว**วนลูป**ดึงข้อมูล**ย่อย**ที่เกี่ยวข้องเพิ่มอีก **N** ครั้ง (**N** queries)
+> ส่งผลให้เกิดคำสั่งค้นหาฐานข้อมูล **มากเกินความจำเป็น**
+
+ชื่อ "N+1" มาจากจำนวน query ทั้งหมด = **N + 1**
+
+#### ตัวอย่างที่เห็นภาพที่สุด
+
+สมมติต้องแสดงรายชื่อผู้ใช้ 100 คน พร้อมจำนวนคำสั่งซื้อของแต่ละคน
+
+```
+query ที่ 1     SELECT * FROM users LIMIT 100                    ← ดึงข้อมูลหลัก 1 ครั้ง
+                ↓ วนลูป 100 รอบ
+query ที่ 2     SELECT * FROM orders WHERE user_id = 1
+query ที่ 3     SELECT * FROM orders WHERE user_id = 2
+query ที่ 4     SELECT * FROM orders WHERE user_id = 3
+   ...                          ...
+query ที่ 101   SELECT * FROM orders WHERE user_id = 100
+
+รวม = 1 + 100 = 101 queries   ทั้งที่ควรใช้แค่ 1–2 queries
+```
+
+#### สาเหตุหลัก — Lazy Loading ของ ORM
+
+ปัญหานี้ **แทบไม่เคยเกิดจากคนตั้งใจเขียน** แต่เกิดจากพฤติกรรมของ ORM
+(Object-Relational Mapping เช่น Hibernate/JPA, Entity Framework, Eloquent, ActiveRecord)
+
+ORM ใช้กลไก **Lazy Loading** — จะยังไม่ดึงข้อมูลความสัมพันธ์ (relation) มา
+จนกว่าจะมีโค้ดไปเรียกใช้จริง ซึ่ง "ตอนเรียกใช้" มักอยู่ **ในลูป** พอดี
+
+```java
+// โค้ดดูสะอาดมาก แต่ซ่อน N+1 ไว้เต็ม ๆ
+List<Account> accounts = accountRepository.findByCustomerId(id);   // 1 query
+
+for (Account acc : accounts) {
+    // ⚠️ ทุกครั้งที่วนลูป Hibernate ยิง SELECT ใหม่ 1 ครั้งเงียบ ๆ
+    List<TransactionLog> txs = txRepository.findByAccountId(acc.getId());
+    total = total.add(sum(txs));
+}
+```
+
+> 🎯 **นี่คือเหตุผลที่ N+1 อันตราย** โค้ดอ่านแล้วสวยงาม ไม่มีอะไรผิดสายตา
+> ทดสอบบนเครื่อง dev ที่มีข้อมูล 10 แถวก็เร็วปกติ **แต่พังตอนขึ้น production ที่มีข้อมูลจริง**
+
+#### ผลกระทบ
+
+| ด้าน | เกิดอะไรขึ้น |
+| --- | --- |
+| **Latency สูง** | เวลาตอบสนองเพิ่มตามจำนวนข้อมูล ยิ่งข้อมูลมากยิ่งช้า |
+| **เปลือง network round-trip** | แต่ละ query เสียเวลาไป-กลับ DB ต่อให้ query เร็วแค่ 1 ms ก็ตาม |
+| **ฐานข้อมูลทำงานหนักเกินจำเป็น** | connection pool ถูกใช้นานขึ้น กระทบ request อื่นทั้งระบบ |
+| **ไม่ scale** | ข้อมูลโต 10 เท่า → query โต 10 เท่า → ช้าลงแบบเชิงเส้น |
+
+> 🏦 **ที่ BCEL จะหนักกว่านี้มาก** ในห้อง Lab ฐานข้อมูลอยู่ในเครื่องเดียวกัน round-trip เกือบ 0
+> แต่ระบบจริงของธนาคาร DB อยู่คนละเครื่อง (บางทีคนละ data center)
+> round-trip อาจ 2–5 ms ต่อครั้ง → **15 queries = เสียเวลาไป-กลับเปล่า ๆ 30–75 ms**
+
+#### วิธีแก้
+
+| วิธี | ทำอย่างไร | เหมาะกับ |
+| --- | --- | --- |
+| **Eager Loading / JOIN FETCH** | สั่ง `JOIN` ดึงข้อมูลย่อยมาพร้อมกันในคำสั่งเดียว | กรณีทั่วไป · แก้ได้ตรงจุดที่สุด |
+| **Batching** | ดึง id ทั้งหมดก่อน แล้วยิง `WHERE id IN (...)` ครั้งเดียว | ข้อมูลย่อยเยอะจน JOIN แล้วแถวบานปลาย |
+| **Projection / DTO Query** | เขียน query คืนเฉพาะฟิลด์ที่ต้องใช้ | หน้าจอที่ต้องการแค่ยอดรวม ไม่ต้องการ entity เต็ม |
+| **`@BatchSize`** (Hibernate) | ให้ Hibernate รวม query ย่อยเป็นชุด | แก้แบบไม่ต้องแตะ query เดิม |
+
+**ตัวอย่างการแก้ด้วย JOIN FETCH ใน Spring Data JPA**
+
+```java
+// ❌ ก่อนแก้ — 1 + N queries
+List<Account> findByCustomerId(Long customerId);
+
+// ✅ หลังแก้ — 1 query เดียวจบ
+@Query("""
+    SELECT DISTINCT a FROM Account a
+    LEFT JOIN FETCH a.transactions
+    WHERE a.customerId = :customerId
+    """)
+List<Account> findByCustomerIdWithTransactions(@Param("customerId") Long customerId);
+```
+
+#### ทำไมต้องใช้ Sentry หา ไม่ใช่แค่ code review
+
+| วิธีตรวจ | ข้อจำกัด |
+| --- | --- |
+| อ่านโค้ดเอง | ORM ซ่อน query ไว้ มองด้วยตาแทบไม่เห็น |
+| ดู log ของ Hibernate | ต้องเปิด `show-sql` ซึ่งทำใน production ไม่ได้ · log ท่วม |
+| **ดู Span ใน Sentry** | ✅ เห็นทุก query **ในระบบจริง** พร้อมเวลา และเห็นว่า request ไหนเป็นคนก่อ |
+
+> Sentry มีการตรวจจับรูปแบบนี้ให้อัตโนมัติในชื่อ **Performance Issue: N+1 Queries**
+> โดยมองหา span ที่มี SQL รูปแบบเดียวกันซ้ำติดกันภายใน transaction เดียว
+> 📎 อ้างอิง: [Sentry Docs — N+1 Queries](https://docs.sentry.io/product/issues/issue-details/performance-issues/n-one-queries/)
+
+#### ในโปรเจกต์นี้ N+1 อยู่ที่ไหน
+
+| รายการ | ค่า |
+| --- | --- |
+| Endpoint | `GET /api/customers/1/summary` |
+| ไฟล์ | `customer/CustomerSummaryService.java` |
+| ข้อมูลหลัก | ลูกค้า 1 คน + บัญชีของเขา = **2 queries** |
+| ข้อมูลย่อย (N) | รายการเดินบัญชีของแต่ละบัญชี ~**15 บัญชี = 15 queries** |
+| **รวม** | **17 queries ต่อ 1 request** |
+| ตัวที่แก้แล้ว | `GET /api/customers/1/summary-fixed` |
+
+ต่อไปนี้เราจะไปหามันด้วย Sentry จริง ๆ
+
+---
+
 ### สถานการณ์จำลอง
 
 > เจ้าหน้าที่สาขาแจ้งว่า "หน้าสรุปลูกค้าและหน้ารายงานประจำวันช้ามาก"
@@ -297,9 +415,43 @@ GET /api/customers/{id}/summary                                   59.73ms
 > ทำให้ช้ากว่าเดิม 3 เท่า และที่ BCEL ซึ่ง DB อยู่คนละเครื่อง จะแย่กว่านี้อีกมาก
 
 **สาเหตุในโค้ด** `customer/CustomerSummaryService.java` วนลูปเรียก repository ทีละบัญชี
+ซึ่งตรงกับกลไก **Lazy Loading ของ ORM** ที่อธิบายไว้ในหัวข้อ 📖 ด้านบนพอดี
 
-**วิธีแก้** ใช้ `JOIN FETCH` หรือ query เดียวที่ดึงทั้งหมดมาแล้วค่อยจัดกลุ่มใน memory
-(ดูตัวอย่างที่ `/summary-fixed`)
+**ให้ผู้เรียนเปิดไฟล์แล้วเทียบกับ waterfall** จะเห็นความสัมพันธ์ 1 ต่อ 1 ชัดเจน
+
+```java
+// CustomerSummaryService.build() — ต้นเหตุของ N+1
+Customer customer = customerRepository.findById(customerId)...;            // ← span ที่ 1
+
+// query ที่ 1: ดึงบัญชีทั้งหมดของลูกค้า
+List<Account> accounts = accountRepository.findByCustomerId(customerId);   // ← span ที่ 2
+
+for (Account account : accounts) {                                         // ← วน 15 รอบ
+    // 💥 query ที่ 2..N+1: วนดึงรายการเคลื่อนไหวทีละบัญชี
+    List<TransactionLog> logs =
+            transactionRepository.findTop10ByAccountIdOrderByTxDateDesc(account.getId());
+    ...                                                                    // ← span ที่ 3–17
+}
+```
+
+**วิธีแก้ที่โปรเจกต์นี้ใช้** — เมธอด `buildFixed()` ดึงทีเดียวด้วย `IN` clause แล้วจัดกลุ่มใน memory
+
+```java
+List<Long> accountIds = accounts.stream().map(Account::getId).toList();
+
+// ดึงทีเดียวทั้งหมด แล้ว groupingBy เอง
+Map<Long, List<TransactionLog>> logsByAccount =
+        transactionRepository.findRecentByAccountIds(accountIds, ...)
+                .stream()
+                .collect(Collectors.groupingBy(TransactionLog::getAccountId));
+```
+
+> 📉 **ลดจาก 17 queries เหลือ 3 queries** และที่สำคัญกว่านั้นคือ
+> **จำนวน query คงที่ไม่ว่าลูกค้าจะมีกี่บัญชี** — จาก O(N) กลายเป็น O(1)
+
+> 💬 **คำถามชวนคิดสำหรับห้อง** ถ้าลูกค้ารายนี้มี 15 บัญชีแล้วช้า 0.34 วินาที
+> แล้วถ้าเป็นลูกค้าองค์กรที่มี 200 บัญชีล่ะ · และถ้าหน้าจอต้องแสดงลูกค้า 20 คนพร้อมกันล่ะ
+> (คำตอบ: 1 + 1 + 200 = 202 queries ต่อคน × 20 คน = **มากกว่า 4,000 queries ต่อการโหลด 1 หน้า**)
 
 > 📌 ข้อมูลจำลองตั้งใจให้ลูกค้ารหัส **1–100** มีบัญชีคนละ ~15 ใบ เพื่อให้ N+1 เห็นชัด
 > ถ้าทดสอบกับลูกค้ารหัสอื่นจะเห็นไม่ชัด

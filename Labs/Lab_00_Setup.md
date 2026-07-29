@@ -147,7 +147,7 @@ cd backend && mvn -B -q dependency:go-offline
 ```
 
 ```bash
-cd frontend && npm ci
+cd frontend && npm i
 ```
 
 ---

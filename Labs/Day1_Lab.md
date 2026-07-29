@@ -5,19 +5,164 @@
 
 > ✅ **สถานะการทดสอบ** ทุกขั้นตอนในเอกสารนี้รันจริงบนเครื่องวิทยากรและยืนยันผลใน Sentry แล้ว
 > ค่าเวลา ผลลัพธ์ และข้อความ error ที่แสดงคือค่าที่ได้จริง
-
+    
 ---
 
 ## ภาพรวม Lab วันที่ 1
 
 | Lab | หัวข้อ | เวลา | ผลลัพธ์ที่จับต้องได้ |
 | --- | --- | --- | --- |
+| 📖 | **อธิบายก่อนลงมือ — Sentry ทำงานอัตโนมัติแค่ไหน** | 15 นาที | ตอบคำถาม "ต้องเขียนทุกฟังก์ชันไหม" |
 | 1.1 | ฝึกตั้งคำถามแบบ Observability | 20 นาที | ตารางคำถาม 3 เสา |
 | 1.2 | วางแผนติดตั้ง Self-hosted สำหรับ BCEL | 30 นาที | เอกสารสเปกเซิร์ฟเวอร์ |
 | 1.3 | ตั้งค่าโปรเจกต์และนโยบายข้อมูล | 20 นาที | Project + Environment + Scrubbing |
 | **1.4** | **ฝัง SDK เข้า Spring Boot** | **60 นาที** | **Issue ตัวแรกใน Sentry** |
 | **1.5** | **Data Scrubbing ปกป้อง PII** | **30 นาที** | **เห็น `[ACCOUNT_REDACTED]`** |
 | **1.6** | **ทดลองกับดัก eventId** | **20 นาที** | **เข้าใจ DuplicateEventDetection** |
+
+---
+
+# 📖 อธิบายก่อนลงมือ — Sentry ทำงานอัตโนมัติแค่ไหน
+
+> วิทยากรบรรยายส่วนนี้ **ก่อนเริ่ม Lab 1.4** ใช้เวลา 10–15 นาที
+> เป็นคำถามที่ผู้เรียนถามเกือบทุกรุ่น ถ้าอธิบายก่อนจะไม่สับสนตลอดทั้งวัน
+
+**คำถามที่ผู้เรียนมักถาม**
+
+> *"เดี๋ยวเราต้องไปไล่เขียน `Sentry.captureException()` ในทุกฟังก์ชันเลยเหรอ
+> ไม่มีแบบแค่ติดตั้ง SDK ใส่ DSN แล้วมันเห็นทั้งโปรเจกต์เองเหรอ"*
+
+**คำตอบสั้น** เห็นเองทั้งโปรเจกต์ครับ ไม่ต้องไล่เขียนรายฟังก์ชัน
+สิ่งที่เราจะเขียนเพิ่มใน Lab นี้มีเหตุผลคนละเรื่องกัน ซึ่งจะอธิบายต่อไปนี้
+
+---
+
+## ก) สิ่งที่ได้ "ฟรี" แค่ติดตั้ง SDK + ใส่ DSN (เขียนโค้ด 0 บรรทัด)
+
+| ได้อะไร | ใครทำให้ |
+| --- | --- |
+| Unhandled exception ทุกตัวทั้งโปรเจกต์ | `SentrySpringFilter` |
+| Transaction ของทุก HTTP request | `SentryTracingFilter` |
+| Span ของทุก SQL query | `sentry-jdbc` (P6Spy) — วันที่ 2 |
+| `log.error()` → Event · `log.info()` → Breadcrumb | `sentry-logback` |
+| Tag: release, environment, url, transaction, server_name | SDK |
+| Session และ Crash Free Rate | `enable-auto-session-tracking` — วันที่ 2 |
+
+> 🎯 **หลักฐานที่ชี้ให้ดูได้ในวันที่ 2** Trace ที่มี 126 spans ตั้งแต่หน้าจอ Angular
+> ไปจนถึง SQL บน MariaDB นั้น **ไม่มีโค้ดที่เราเขียนเองแม้บรรทัดเดียว** มีแต่การเติม config
+> Performance Tracing เป็นอัตโนมัติ 100%
+
+---
+
+## ข) แล้วทำไมโปรเจกต์นี้ยังต้องเขียนเพิ่ม
+
+เพราะโปรเจกต์นี้ (และระบบ enterprise เกือบทุกระบบ) มี `@RestControllerAdvice`
+ที่ทำหน้าที่ **"กลืน" exception ทุกตัว** ก่อนส่ง response ให้ผู้ใช้
+
+```java
+@ExceptionHandler(Exception.class)
+public ResponseEntity<ApiError> handleAll(Exception e) {
+    return ResponseEntity.status(500).body(...);   // ← จับแล้วตอบเป็น response ปกติ
+}
+```
+
+**เส้นทางของ exception เมื่อมี `@ControllerAdvice`**
+
+```
+Controller โยน exception
+        ↓
+@ExceptionHandler จับไว้
+        ↓
+คืน HTTP 500 พร้อม ApiError ให้ผู้ใช้ → จบ
+        ↑
+   ไม่มีอะไรทะลุออกมาถึง filter ของ Sentry
+   ในสายตาของ Spring คือ "จัดการเรียบร้อยแล้ว"  →  Sentry ไม่เห็นอะไรเลย ❌
+```
+
+**เส้นทางเมื่อไม่มี `@ControllerAdvice`**
+
+```
+Controller โยน exception
+        ↓
+ทะลุออกมาถึง SentrySpringFilter  →  Sentry จับเอง ✅
+```
+
+> ⚠️ **นี่ไม่ใช่ข้อจำกัดของ Sentry** แต่เป็นผลข้างเคียงของ pattern ที่แทบทุกระบบองค์กรใช้
+> และเป็น **สาเหตุอันดับหนึ่ง** ที่ทีมติดตั้ง Sentry เสร็จแล้วบ่นว่า "ไม่เห็น error เลยสักตัว"
+
+---
+
+## ค) วิธีแก้ระดับทั้งโปรเจกต์ = **1 บรรทัด** ไม่ต้องแตะโค้ด
+
+```properties
+sentry.exception-resolver-order=-2147483647
+```
+
+บรรทัดเดียวนี้ทำให้ `SentryExceptionResolver` ทำงาน **ก่อน** `@ExceptionHandler` ของเรา
+จับ exception ได้ครบทั้งโปรเจกต์ **โดยไม่ต้องแก้ handler สักตัว**
+
+*(เลข `-2147483647` มาจากไหน อธิบายละเอียดใน Lab 1.4 ขั้นที่ 2)*
+
+**หลักฐานจากการทดสอบจริง** เปิด `sentry.debug=true` แล้วยิง `/boom` จะได้ log นี้
+
+```
+DEBUG: Duplicate Exception detected. Event 50a0b5db... will be discarded.
+DEBUG: Event was dropped by a processor: DuplicateEventDetectionEventProcessor
+```
+
+แปลว่า **Sentry จับไปเรียบร้อยแล้ว ก่อนที่โค้ด `captureException` ของเราจะได้ทำงานด้วยซ้ำ**
+ยืนยันว่า property ตัวเดียวนี้เพียงพอจริง
+
+---
+
+## ง) แล้ว `captureException` ที่จะเขียนใน Lab 1.4 มีไว้ทำไม
+
+มี 2 ที่ และ **ไม่จำเป็นทั้งคู่** — เขียนเพื่อสอนคนละประเด็นกัน
+
+| ไฟล์ | เขียนเพื่อ | จำเป็นไหม |
+| --- | --- | --- |
+| `GlobalExceptionHandler` | อยากได้ **eventId** กลับมาโชว์ผู้ใช้เป็นรหัสอ้างอิงแจ้ง Support | **ไม่จำเป็น** ลบทิ้งได้ error ยังเข้า Sentry ครบ |
+| `SentryDebugController` | เป็น **ห้องทดลองสอน API** ไม่ใช่โค้ด production | **ไม่จำเป็น** production ต้องลบทิ้งทั้งไฟล์ |
+
+`SentryDebugController` ออกแบบมาให้เห็นความต่างของ 3 แบบในที่เดียว
+
+| Endpoint | สอนอะไร |
+| --- | --- |
+| `/boom` | **อัตโนมัติ** — โยนแล้วจบ ไม่ต้องเขียนอะไร Sentry จับเอง |
+| `/capture` | **ต้องเขียนเอง** — เพราะ `try/catch` กลืนไว้แล้วไม่ throw ต่อ |
+| `/message` | **ต้องเขียนเอง** — ส่งข้อความที่ไม่ใช่ exception เลย |
+
+---
+
+## จ) สรุป: เมื่อไหร่ต้องเขียนเอง เมื่อไหร่ไม่ต้อง
+
+| สถานการณ์ | อัตโนมัติ? |
+| --- | --- |
+| Controller / Service โยน exception ออกมาตรง ๆ | ✅ ไม่ต้องเขียน |
+| มี `@ControllerAdvice` กลืนไว้ | ✅ เติม `exception-resolver-order` 1 บรรทัด |
+| ทุก HTTP request และ SQL query | ✅ ไม่ต้องเขียน |
+| `try { } catch (e) { log.warn(...) }` แล้วจบ ไม่ throw ต่อ | ❌ ต้อง `captureException(e)` เอง |
+| เหตุการณ์ทางธุรกิจที่ไม่ใช่ error เช่น "ตรวจพบการโอนซ้ำ" | ❌ ต้อง `captureMessage()` เอง |
+| งานใน background thread · batch · `@Scheduled` | ⚠️ ต้อง wrap เอง เพราะไม่ผ่าน filter ของ web |
+| อยากคุม fingerprint หรือใส่ tag เฉพาะ | ❌ ต้องใช้ `Sentry.withScope()` |
+
+---
+
+## ฉ) ถ้าเอาไปใช้จริงที่ BCEL ต้องเขียนแค่ไหน
+
+โค้ดที่ต้องเขียนจริง ๆ ทั้งระบบมีแค่ **3 อย่าง** ที่เหลือเป็น config ล้วน ๆ
+
+| # | เขียนที่ไหน | ขนาด | ทำไม |
+| --- | --- | --- | --- |
+| 1 | `application.properties` | ~10 บรรทัด | DSN / environment / resolver-order |
+| 2 | `BcelDataScrubber` | 1 คลาส | ปกปิดเลขบัญชีก่อนออกจากองค์กร (บังคับสำหรับธนาคาร) |
+| 3 | `SentryUserContextFilter` | 1 คลาส | ผูกรหัสพนักงานและสาขาเข้ากับ error |
+
+**ไม่ต้องแตะ Controller หรือ Service สักไฟล์เดียว**
+
+> 💬 **ประโยคสรุปที่ใช้พูดปิดหัวข้อนี้ได้เลย**
+> *"Sentry ไม่ได้ให้เราไปไล่เขียนทีละฟังก์ชัน มันดักไว้ที่ชั้น framework ให้หมดแล้ว
+> เราเขียนเพิ่มเฉพาะตอนที่ **โค้ดของเราเองไปบังไม่ให้ exception ทะลุออกมา** เท่านั้น"*
 
 ---
 
@@ -152,6 +297,132 @@ sentry.logging.minimum-event-level=error
 | `sentry.exception-resolver-order` | ให้ Sentry จับก่อน `@ControllerAdvice` | exception ที่มี handler จะหายไปหมด |
 | `sentry.ignored-exceptions-for-type` | ไม่ส่ง error ที่เป็นเรื่องปกติทางธุรกิจ | Issue ท่วมด้วย validation error |
 | `sentry.logging.minimum-event-level` | `log.error()` จะกลายเป็น event | (ดูกับดักใน Lab 1.6) |
+
+---
+
+#### 🔢 เจาะลึก: เลข `-2147483647` คืออะไร มาจากไหน
+
+> ค่าทุกตัวในหัวข้อนี้ **อ่านมาจากไบต์โค้ดของไลบรารีจริง** ด้วย `javap` ไม่ใช่จากเอกสาร
+
+**1) มันคือ `Integer.MIN_VALUE + 1`**
+
+```
+Integer.MIN_VALUE      = -2147483648    ← ค่าต่ำสุดของ int 32 บิต
+                                          Spring เรียกว่า Ordered.HIGHEST_PRECEDENCE
+Integer.MIN_VALUE + 1  = -2147483647    ← เลขที่เราใส่
+```
+
+**2) กติกาของ Spring — เลขน้อยกว่า = ได้ทำงานก่อน**
+
+Spring มี `HandlerExceptionResolverComposite` ที่เก็บ resolver ทั้งหมดเรียงตาม order
+แล้วไล่เรียกทีละตัว **ตัวไหนคืน `ModelAndView` ที่ไม่ใช่ `null` ก่อน = จบทันที ตัวที่เหลือไม่ได้ทำงาน**
+
+**3) ค่า order จริงของแต่ละตัว**
+
+| Resolver | order | ตรวจสอบจาก |
+| --- | --- | --- |
+| `DefaultErrorAttributes` (Spring Boot) | **-2147483648** | `javap` → `ldc int -2147483648` |
+| `SentryExceptionResolver` (**ค่าปริยาย**) | **1** | `javap SentryProperties` → `iconst_1` |
+| `HandlerExceptionResolverComposite`<br>(ตัวที่ห่อ `@ControllerAdvice` ไว้) | **0** | `javap WebMvcConfigurationSupport` → `iconst_0` + `setOrder(I)` |
+
+**4) ทำไมค่าปริยายถึงพัง**
+
+```
+ค่าปริยาย — Sentry อยู่ที่ order 1
+
+  -2147483648   DefaultErrorAttributes        คืน null  →  ไปต่อ
+            0   @ControllerAdvice ของเรา      คืน ModelAndView  ✋ จบตรงนี้
+            1   SentryExceptionResolver       ไม่เคยได้ทำงาน  ❌
+```
+
+**5) หลังตั้ง `-2147483647`**
+
+```
+หลังตั้งค่า — Sentry แทรกเข้ามาเป็นอันดับ 2
+
+  -2147483648   DefaultErrorAttributes        คืน null  →  ไปต่อ
+  -2147483647   SentryExceptionResolver       จับ exception ส่ง Sentry ✅
+                                              แล้วคืน null  →  ไปต่อ
+            0   @ControllerAdvice ของเรา      คืน ModelAndView ให้ผู้ใช้ตามปกติ ✅
+```
+
+**ได้ทั้งสองอย่างพร้อมกัน** — Sentry เห็น error ครบ **และ** ผู้ใช้ยังได้ response ที่สวยและปลอดภัยเหมือนเดิม
+
+**6) ทำไมไม่ใช้ `-2147483648` ไปเลยให้สุด**
+
+เพราะช่องนั้น **`DefaultErrorAttributes` ของ Spring Boot จองไว้แล้ว** มันทำหน้าที่เก็บ exception
+ไว้ใน request attribute ให้หน้า `/error` และ Actuator เอาไปใช้ต่อ
+ถ้าเราไปแย่งลำดับกับมันอาจกระทบพฤติกรรมของ error page
+
+> 🔑 `-2147483647` จึงแปลว่า **"ขอเป็นคนที่สอง รองจากของ Spring Boot เอง แต่มาก่อนทุกคนที่เหลือ"**
+
+**7) ถ้าอยากเขียนให้อ่านรู้เรื่องกว่าตัวเลขดิบ**
+
+ใน `.properties` ใส่ได้แค่ตัวเลข แต่ถ้ากำหนดผ่าน Java config จะสื่อความหมายกว่ามาก
+
+```java
+@Bean
+SentryExceptionResolver sentryExceptionResolver(IScopes scopes, TransactionNameProvider p) {
+    return new SentryExceptionResolver(scopes, p, Ordered.HIGHEST_PRECEDENCE + 1);
+}
+```
+
+> 💡 **จุดที่ควรย้ำในห้อง** ผู้เรียนมักคิดว่า `-2147483647` เป็นเลขวิเศษที่ Sentry คิดขึ้นเอง
+> จริง ๆ มันคือ **"อันดับ 2 ในระบบ order ของ Spring"** ซึ่งเป็นแนวคิดของ **Spring ไม่ใช่ของ Sentry**
+> เข้าใจตรงนี้แล้วจะเอาไปคุมลำดับของ `Filter`, `Interceptor`, `@Order` และ Aspect ตัวอื่นได้ด้วยหลักเดียวกัน
+
+---
+
+#### 🏦 คำถามที่ BCEL ต้องตอบ: ยังต้องมี `GlobalExceptionHandler` อยู่ไหม
+
+**จำเป็นครับ และจำเป็นมากกว่าองค์กรทั่วไป — แต่ด้วยเหตุผลที่ไม่เกี่ยวกับ Sentry เลย**
+
+ถ้า **ไม่มี** ไฟล์นี้ ผู้ใช้จะได้สิ่งนี้กลับไปเมื่อระบบพัง
+
+```json
+{
+  "timestamp": "2026-07-29T08:14:22.913+00:00",
+  "status": 500,
+  "error": "Internal Server Error",
+  "trace": "java.lang.NullPointerException: Cannot invoke \"Account.getBalance()\"
+    at la.com.bcel.crm.customer.CustomerStatementService.calculate(CustomerStatementService.java:88)
+    at org.mariadb.jdbc.Connection...",
+  "path": "/api/customers/4999/statement"
+}
+```
+
+นี่คือการ **เปิดเผยโครงสร้างภายในระบบธนาคารให้คนนอกเห็น** — ชื่อ package, ชื่อคลาส, เลขบรรทัด,
+ไลบรารีและเวอร์ชันที่ใช้ ซึ่งเป็นข้อมูลตั้งต้นชั้นดีของผู้โจมตี และมักผิดข้อกำหนด security audit ตรง ๆ
+
+**หน้าที่ของ `GlobalExceptionHandler` ที่ Sentry แทนไม่ได้**
+
+| หน้าที่ | ทำไมสำคัญกับธนาคาร |
+| --- | --- |
+| ไม่ให้ stack trace หลุดออกไปหาผู้ใช้ | ความปลอดภัย · ข้อกำหนด audit |
+| คุม HTTP status ให้ตรงความหมาย | 400 / 404 / 409 / 500 แยกกันชัดเจน |
+| รูปแบบ error response เดียวกันทั้งระบบ | ทีม Frontend และระบบที่มาเชื่อมต่อพึ่งพาสัญญานี้ |
+| แปลข้อความให้ผู้ใช้อ่านรู้เรื่อง | เจ้าหน้าที่สาขาไม่ควรเห็นคำว่า `NullPointerException` |
+
+**สองอย่างนี้แยกหน้าที่กันชัดเจน ไม่ได้มาแทนกัน**
+
+```
+GlobalExceptionHandler  →  คุมสิ่งที่ "ผู้ใช้" เห็น      (ต้องปลอดภัย สั้น อ่านรู้เรื่อง)
+Sentry                  →  คุมสิ่งที่ "นักพัฒนา" เห็น    (ต้องละเอียดที่สุดเท่าที่จะทำได้)
+
+sentry.exception-resolver-order  =  กาวที่ทำให้ทั้งสองอยู่ร่วมกันได้
+```
+
+**สรุปสิ่งที่ BCEL ควรทำ**
+
+| | สิ่งที่ต้องทำ | เหตุผล |
+| --- | --- | --- |
+| ✅ | **เก็บ `GlobalExceptionHandler` ไว้** | จำเป็นด้านความปลอดภัยและ API contract |
+| ✅ | **ใส่ `sentry.exception-resolver-order=-2147483647`** | ทำให้ Sentry เห็น error ทั้งที่มี handler |
+| ✅ | **คง `ignored-exceptions-for-type` ไว้** | `BusinessValidationException` ไม่ใช่บั๊ก ไม่ควรไปกวน Sentry |
+| ⚠️ | **`captureException` ใน handler — เลือกเอา** | ใส่เมื่ออยากได้ eventId ไปโชว์ผู้ใช้เท่านั้น (ดู Lab 1.6) |
+| ❌ | **ลบ `SentryDebugController` ทิ้ง** | เป็นของสำหรับสอน มี `@Profile("!production")` กันไว้แล้ว แต่ควรลบจริง ๆ ตอนขึ้น production |
+
+---
 
 ### ขั้นที่ 3 — เพิ่ม captureException ใน 3 จุด
 
