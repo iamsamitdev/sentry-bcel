@@ -222,16 +222,44 @@ HikariPool-1 - Added connection com.p6spy.engine.wrapper.ConnectionWrapper@...
 curl -s -o /dev/null http://localhost:8080/api/customers?page=0&size=20
 ```
 
-รอประมาณ 1–2 นาที แล้วเปิด **Insights → Backend** จะเห็นการ์ด **Queries by Time Spent**
-พร้อม SQL จริง เช่น
+รอประมาณ 1–2 นาที แล้วไปดูผลตามเส้นทางนี้
 
 ```
-SELECT branch_code, COUNT(*), SUM(amount) FROM transaction_log t
-WHERE tx_date >= %s AND tx_date < %s GROUP BY branch_code ORDER BY totalAmount DESC
+เมนูซ้าย → Dashboards → Sentry Built → Backend Overview
 ```
 
-> ⏱️ **ข้อมูลไม่ขึ้นทันที** span ใช้เวลาประมวลผลราว 1–2 นาที ให้ผู้เรียนยิง request แล้วพักเบรก
+> ⚠️ **UI นี้ไม่มีเมนู "Insights"** เอกสาร Sentry หลายที่ยังเขียนว่า *Insights → Backend*
+> แต่เวอร์ชันปัจจุบันย้ายไปอยู่ใต้ **Dashboards → Sentry Built** แล้ว
+> ถ้าหาไม่เจอ ให้พิมพ์ URL ตรง ๆ: `https://<org>.sentry.io/dashboard/<id>/`
+
+**ตั้ง filter 2 อย่างก่อน มิฉะนั้นจะเห็นหน้าว่าง**
+
+| Filter | ตั้งเป็น |
+| --- | --- |
+| Project | `bcel-crm-backend` |
+| ช่วงเวลา | **7D** (ค่าปริยาย 24H มักไม่ครอบคลุมข้อมูลที่ยิงไว้เมื่อวาน) |
+
+เลื่อนลงมาจะเห็นการ์ด **Queries by Time Spent** พร้อม SQL จริง
+
+**ผลที่ได้จริงบนเครื่องทดสอบ**
+
+```
+SELECT branch_code, COUNT(*), SUM(amount) FRO…     973.13 ms   ← daily-summary ตัวช้า
+SELECT branch_code, COUNT(*), SUM(amount) FRO…     193.19 ms   ← daily-summary-fast
+SELECT .. FROM transaction_log tl1_0 WHERE accou…    1.61 ms   ← ตัวที่ก่อ N+1
+```
+
+เลื่อนลงอีกจะเจอตาราง **Transactions** ที่มี P50 · P95 · Failure Rate · Time Spent ครบ
+
+> ⏱️ **ข้อมูลไม่ขึ้นทันที** span ใช้เวลาประมวลผลราว 1–2 นาที และ Dashboard นี้มี 7 widget
+> จึงโหลดช้า (20–30 วินาที) ให้ผู้เรียนยิง request แล้วพักเบรก
 > อย่าตกใจว่า "ทำผิด" ถ้ากดดูภายใน 10 วินาทีแรกแล้วยังว่าง
+
+**ทางเลือกที่ยืดหยุ่นกว่า** ถ้าอยากได้เฉพาะอันดับ query ที่กินเวลารวมมากที่สุด
+
+```
+Explore → Traces → Group By: span.description → Visualize: sum(span.duration)
+```
 
 ---
 
@@ -767,7 +795,7 @@ span ต้องผ่านการประมวลผลก่อน อ�
 | 1 | ยุบ Issue ที่แตกกลุ่มได้ | `/split` = 5 Issue · `/split-fixed` = 1 Issue 5 events |
 | 2 | Issue มี User + Tag + Breadcrumb | Issue แสดง `teller-042` และ `branch_code` |
 | 3 | P6Spy ทำงาน | log ตอน start มี `p6spy.engine.wrapper.ConnectionWrapper` |
-| 4 | เห็น Query เป็น Span | Insights → Backend → Queries by Time Spent มี SQL จริง |
+| 4 | เห็น Query เป็น Span | Dashboards → Sentry Built → Backend Overview → การ์ด Queries by Time Spent มี SQL จริง |
 | 5 | **หา N+1 เจอจาก Sentry** | เห็น `db.query` รูปแบบเดิม 15 อันใน 1 transaction |
 | 6 | **หา Slow Query เจอ** | เทียบ `daily-summary` 2.0s กับ `-fast` 0.16s ได้ |
 | 7 | Angular ส่ง Error เข้า Sentry | Issues ของ `bcel-crm-frontend` มี 3 รายการ |
